@@ -26,7 +26,7 @@
 ### 2. 克隆项目运行
 - 克隆项目
 ```bash
-git clone https://github.com/your/repo.git
+git clone https://github.com/wiizz3/ruijie_helper.git
 ```
 - 定位项目
 ```bash
