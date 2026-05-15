@@ -1,0 +1,196 @@
+import psutil
+import os
+import sys
+import shutil
+import json
+import subprocess
+from pathlib import Path
+from typing import Optional
+
+CREATE_NO_WINDOW = 0x08000000
+
+def _get_data_dir() -> Path:
+    """用户数据目录（%APPDATA%/ruijie_helper）"""
+    # 优先使用 APPDATA 环境变量（Windows），否则回退到用户主目录
+    base = Path(os.environ.get("APPDATA", os.path.expanduser("~")))
+    data_dir = base / "ruijie_helper"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+# 配置文件路径：%APPDATA%/ruijie_helper/config.json
+RECORD_FILE = _get_data_dir() / "config.json"
+
+
+class SupplicantConfig:
+    """认证客户端（Supplicant）配置管理器。
+    负责读写 JSON 配置文件，并提供移动记录、目标文件夹等特定配置项的存取。
+    """
+
+    @staticmethod
+    def load() -> dict:
+        """加载配置文件内容，返回字典。
+        如果文件不存在或格式错误，返回空字典。兼容旧列表格式。
+        """
+        if RECORD_FILE.exists():
+            try:
+                with open(RECORD_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # 兼容旧列表格式（若存在）
+                if isinstance(data, list):
+                    return {}
+                if isinstance(data, dict):
+                    return data
+            except:
+                pass
+        return {}
+
+    @staticmethod
+    def save(data: dict):
+        """保存配置字典到 JSON 文件。"""
+        RECORD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(RECORD_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def get_move_record() -> Optional[dict]:
+        """获取移动操作记录（字典），若不存在则返回 None。"""
+        record = SupplicantConfig.load().get("move_record")
+        if isinstance(record, dict):
+            return record
+        return None
+
+    @staticmethod
+    def set_move_record(record: dict):
+        """保存移动操作记录到配置。"""
+        full = SupplicantConfig.load()
+        full["move_record"] = record
+        SupplicantConfig.save(full)
+
+    @staticmethod
+    def clear_move_record():
+        """清除配置中的移动操作记录。"""
+        full = SupplicantConfig.load()
+        full.pop("move_record", None)
+        SupplicantConfig.save(full)
+
+    @staticmethod
+    def get_target_folder() -> str:
+        """获取目标文件夹路径，默认值为 D:/temp_folder。"""
+        folder = SupplicantConfig.load().get("move_target_folder", "")
+        if not folder:
+            folder = "D:/temp_folder"
+        return folder
+
+    @staticmethod
+    def set_target_folder(folder: str):
+        """设置目标文件夹路径并保存。"""
+        full = SupplicantConfig.load()
+        full["move_target_folder"] = folder
+        SupplicantConfig.save(full)
+
+
+class SupplicantManager:
+    """认证客户端进程管理器。
+    用于检查、启动、终止 8021x.exe 进程，以及将其移动/恢复到其他位置。
+    """
+
+    PROCESS_NAME = "8021x.exe"  # 目标进程
+
+    @classmethod
+    def is_running(cls) -> bool:
+        """检查 8021x.exe 进程当前是否在运行。"""
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if proc.info["name"] and proc.info["name"].lower() == cls.PROCESS_NAME.lower():
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return False
+
+    @classmethod
+    def get_exe_path(cls) -> Optional[str]:
+        """获取正在运行的 8021x.exe 可执行文件的完整路径，如果未运行则返回 None。"""
+        for proc in psutil.process_iter(["name", "exe"]):
+            try:
+                if proc.info["name"] and proc.info["name"].lower() == cls.PROCESS_NAME.lower():
+                    return proc.info["exe"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return None
+
+    @classmethod
+    def start_exe(cls, exe_path: str) -> bool:
+        """启动指定路径的可执行文件（无窗口）。返回是否成功。"""
+        try:
+            subprocess.Popen(
+                [exe_path], #直接传列表
+                creationflags=CREATE_NO_WINDOW,
+                shell=False
+            )
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def kill_and_move(cls, target_folder: str = None) -> bool:
+        """终止所有 8021x.exe 进程，并将可执行文件移动到指定文件夹。
+        如果未指定目标文件夹，则使用配置中的路径。
+        操作成功后记录移动信息，返回是否成功。
+        """
+        if not cls.is_running():
+            return False    # 进程未运行，无需操作
+
+        exe_path = cls.get_exe_path()
+        if not exe_path:
+            return False    # 未能获取路
+
+        # 确定目标文件夹
+        if target_folder is None:
+            target_folder = SupplicantConfig.get_target_folder()
+        target_dir = Path(target_folder)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # 强制终止所有同名进程
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if proc.info["name"] and proc.info["name"].lower() == cls.PROCESS_NAME.lower():
+                    proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        # 移动可执行文件
+        src = Path(exe_path)
+        if not src.exists():
+            return False
+        dest = target_dir / src.name
+        shutil.move(str(src), str(dest))
+
+        # 记录移动操作到配置文件
+        SupplicantConfig.set_move_record({
+            "action": "kill_and_move",
+            "original_path": str(src),
+            "moved_to": str(dest)
+        })
+        return True
+
+    @classmethod
+    def restore(cls) -> bool:
+        """根据配置中的移动记录，将文件从目标位置移回原始路径。
+        成功恢复后清除记录，返回是否成功。
+        """
+        record = SupplicantConfig.get_move_record()
+        if not record or record.get("action") != "kill_and_move":
+            return False    # 无有效记录
+
+        original = Path(record["original_path"])
+        moved_file = Path(record["moved_to"])
+        if not moved_file.exists():
+            return False    # 源文件不存在，无法恢复
+
+        # 确保原始目录存在
+        original.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(moved_file), str(original))
+
+        # 清除移动记录
+        SupplicantConfig.clear_move_record()
+        return True
